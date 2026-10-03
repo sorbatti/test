@@ -22,9 +22,11 @@ button:disabled{opacity:.4}
 <h2>Camera / PiP Test</h2>
 
 <div class="row">
-<select id="camera"></select>
-<button id="refresh">カメラ更新</button>
-<button id="startCamera">カメラ開始</button>
+<select id="cameraMode">
+    <option value="environment" selected>背面カメラ</option>
+    <option value="user">前面カメラ</option>
+</select>
+<button id="startCamera">カメラ開始 / 切替</button>
 </div>
 
 <div class="row">
@@ -86,7 +88,7 @@ PiP方式を変更するときは、一度「PiP終了」を押してから別�
 <script>
 const $=s=>document.querySelector(s);
 
-const camera=$('#camera');
+const cameraMode=$('#cameraMode');
 const live=$('#live');
 const playback=$('#playback');
 const copyCanvas=$('#copyCanvas');
@@ -118,31 +120,6 @@ function log(msg){
     statusBox.scrollTop=statusBox.scrollHeight;
 }
 
-async function enumerateCameras(){
-    try{
-        const devices=await navigator.mediaDevices.enumerateDevices();
-        const cams=devices.filter(d=>d.kind==='videoinput');
-        const old=camera.value;
-
-        camera.innerHTML='';
-
-        cams.forEach((d,i)=>{
-            const o=document.createElement('option');
-            o.value=d.deviceId;
-            o.textContent=d.label||`Camera ${i+1}`;
-            camera.appendChild(o);
-        });
-
-        if([...camera.options].some(o=>o.value===old)){
-            camera.value=old;
-        }
-
-        log(`カメラ ${cams.length}台`);
-    }catch(e){
-        log(`enumerateDevices ERROR: ${e.name}: ${e.message}`);
-    }
-}
-
 function stopCanvasCopy(){
     if(canvasRAF!==null){
         cancelAnimationFrame(canvasRAF);
@@ -160,9 +137,10 @@ function stopCanvasCopy(){
 async function prepareCanvasCopy(){
     stopCanvasCopy();
 
-    if(!stream) return;
+    if(!stream)return;
 
-    const settings=stream.getVideoTracks()[0]?.getSettings()||{};
+    const videoTrack=stream.getVideoTracks()[0];
+    const settings=videoTrack?.getSettings()||{};
 
     copyCanvas.width=settings.width||1280;
     copyCanvas.height=settings.height||720;
@@ -217,23 +195,46 @@ async function startCamera(){
 
         if(stream){
             stream.getTracks().forEach(t=>t.stop());
+            stream=null;
         }
 
-        const constraints={
-            video:camera.value
-                ? {deviceId:{exact:camera.value}}
-                : {facingMode:{ideal:'environment'}},
-            audio:true
-        };
+        const mode=cameraMode.value;
 
-        stream=await navigator.mediaDevices.getUserMedia(constraints);
+        log(`カメラ要求: ${mode}`);
+
+        try{
+            stream=await navigator.mediaDevices.getUserMedia({
+                video:{
+                    facingMode:{exact:mode}
+                },
+                audio:true
+            });
+        }catch(e){
+            log(`exact失敗 → idealで再試行: ${e.name}`);
+
+            stream=await navigator.mediaDevices.getUserMedia({
+                video:{
+                    facingMode:{ideal:mode}
+                },
+                audio:true
+            });
+        }
 
         live.srcObject=stream;
         await live.play();
 
-        for(const track of stream.getTracks()){
-            log(`${track.kind}: ${track.label}`);
+        const videoTrack=stream.getVideoTracks()[0];
 
+        log(`選択モード=${mode}`);
+        log(`実際のカメラ=${videoTrack?.label||'(labelなし)'}`);
+
+        if(videoTrack){
+            try{
+                log(`settings=${JSON.stringify(videoTrack.getSettings())}`);
+            }catch(e){}
+        }
+
+        for(const track of stream.getTracks()){
             track.addEventListener('mute',()=>{
                 log(`${track.kind} TRACK MUTED`);
             });
@@ -247,15 +248,6 @@ async function startCamera(){
             });
         }
 
-        await enumerateCameras();
-
-        /*
-         * 重要:
-         * PiPボタンを押した後にcanvas生成やvideo.play()をすると
-         * SafariのTransient User Activationを失うことがある。
-         *
-         * そのためPiP用videoはこの時点で事前準備しておく。
-         */
         await prepareCanvasCopy();
         await prepareDummy();
 
@@ -294,7 +286,7 @@ function getMime(){
 }
 
 function startRecording(){
-    if(!stream) return;
+    if(!stream)return;
 
     chunks=[];
 
@@ -337,9 +329,7 @@ function startRecording(){
             $('#download').download=`pip_test_${Date.now()}.${ext}`;
             $('#download').hidden=false;
 
-            log(
-                `録画完成 ${(blob.size/1024/1024).toFixed(2)} MB`
-            );
+            log(`録画完成 ${(blob.size/1024/1024).toFixed(2)} MB`);
         });
 
         recorder.start(1000);
@@ -364,32 +354,18 @@ function stopRecording(){
     }
 }
 
-/*
- * ---------------------------------------------------------
- * PiP
- *
- * ここではasync/awaitをPiP要求の「前」に絶対入れない。
- *
- * requestPictureInPicture()をクリックハンドラから直接呼ぶ。
- * ---------------------------------------------------------
- */
-
 function requestCameraPip(){
     log('----- A: Camera直接PiP 要求 -----');
 
     if(document.pictureInPictureElement){
-        log('ERROR: すでにPiP中。先にPiP終了を押してください');
+        log('ERROR: すでにPiP中');
         return;
     }
 
     try{
-        const promise=live.requestPictureInPicture();
-
-        promise.then(()=>{
-            log('A: Camera直接PiP 成功');
-        }).catch(e=>{
-            log(`A PiP ERROR: ${e.name}: ${e.message}`);
-        });
+        live.requestPictureInPicture()
+            .then(()=>log('A: Camera直接PiP 成功'))
+            .catch(e=>log(`A PiP ERROR: ${e.name}: ${e.message}`));
     }catch(e){
         log(`A PiP ERROR: ${e.name}: ${e.message}`);
     }
@@ -399,23 +375,19 @@ function requestCanvasPip(){
     log('----- B: Canvas経由PiP 要求 -----');
 
     if(document.pictureInPictureElement){
-        log('ERROR: すでにPiP中。先にPiP終了を押してください');
+        log('ERROR: すでにPiP中');
         return;
     }
 
     if(!canvasVideo.srcObject){
-        log('ERROR: Canvas PiPが準備されていません');
+        log('ERROR: Canvas PiP未準備');
         return;
     }
 
     try{
-        const promise=canvasVideo.requestPictureInPicture();
-
-        promise.then(()=>{
-            log('B: Canvas経由PiP 成功');
-        }).catch(e=>{
-            log(`B PiP ERROR: ${e.name}: ${e.message}`);
-        });
+        canvasVideo.requestPictureInPicture()
+            .then(()=>log('B: Canvas経由PiP 成功'))
+            .catch(e=>log(`B PiP ERROR: ${e.name}: ${e.message}`));
     }catch(e){
         log(`B PiP ERROR: ${e.name}: ${e.message}`);
     }
@@ -425,18 +397,14 @@ function requestDummyPip(){
     log('----- C: 別動画PiP 要求 -----');
 
     if(document.pictureInPictureElement){
-        log('ERROR: すでにPiP中。先にPiP終了を押してください');
+        log('ERROR: すでにPiP中');
         return;
     }
 
     try{
-        const promise=dummyVideo.requestPictureInPicture();
-
-        promise.then(()=>{
-            log('C: 別動画PiP 成功');
-        }).catch(e=>{
-            log(`C PiP ERROR: ${e.name}: ${e.message}`);
-        });
+        dummyVideo.requestPictureInPicture()
+            .then(()=>log('C: 別動画PiP 成功'))
+            .catch(e=>log(`C PiP ERROR: ${e.name}: ${e.message}`));
     }catch(e){
         log(`C PiP ERROR: ${e.name}: ${e.message}`);
     }
@@ -448,24 +416,16 @@ function exitPip(){
         return;
     }
 
-    /*
-     * exitはuser activationを厳密に必要としないが
-     * ボタン直下でそのまま呼ぶ。
-     */
     document.exitPictureInPicture()
-        .then(()=>{
-            log('PiP終了');
-        })
-        .catch(e=>{
-            log(`PiP終了 ERROR: ${e.name}: ${e.message}`);
-        });
+        .then(()=>log('PiP終了'))
+        .catch(e=>log(`PiP終了 ERROR: ${e.name}: ${e.message}`));
 }
 
 function dumpState(reason){
     log(`--- STATE: ${reason} ---`);
     log(`visibility=${document.visibilityState}`);
     log(`focus=${document.hasFocus()}`);
-    log(`PiP=${document.pictureInPictureElement ? 'YES':'NO'}`);
+    log(`PiP=${document.pictureInPictureElement?'YES':'NO'}`);
 
     if(stream){
         for(const t of stream.getTracks()){
@@ -491,7 +451,7 @@ function startFreezeMonitor(){
     lastVideoTime=live.currentTime;
 
     freezeCheckTimer=setInterval(()=>{
-        if(!stream) return;
+        if(!stream)return;
 
         const t=live.currentTime;
 
@@ -555,15 +515,8 @@ window.addEventListener('blur',()=>{
 
     v.addEventListener('error',()=>{
         const e=v.error;
-        log(
-            `${name}: VIDEO ERROR `+
-            `${e ? `${e.code}` : 'unknown'}`
-        );
+        log(`${name}: VIDEO ERROR ${e?e.code:'unknown'}`);
     });
-});
-
-$('#refresh').addEventListener('click',()=>{
-    enumerateCameras();
 });
 
 startCameraBtn.addEventListener('click',()=>{
@@ -578,16 +531,13 @@ stopRecBtn.addEventListener('click',()=>{
     stopRecording();
 });
 
-/*
- * PiPボタンは意図的にasyncにしない。
- */
 pipCameraBtn.addEventListener('click',requestCameraPip);
 pipCanvasBtn.addEventListener('click',requestCanvasPip);
 pipDummyBtn.addEventListener('click',requestDummyPip);
 
 $('#exitPip').addEventListener('click',exitPip);
 
-camera.addEventListener('change',()=>{
+cameraMode.addEventListener('change',()=>{
     if(stream){
         startCamera();
     }
@@ -603,6 +553,9 @@ camera.addEventListener('change',()=>{
         return;
     }
 
-    try{
-        /*
-         * デバイス名表示のための初回
+    log('準備完了');
+    log('「カメラ開始 / 切替」を押してください');
+})();
+</script>
+</body>
+</html>
