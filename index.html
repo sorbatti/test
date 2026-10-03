@@ -3,139 +3,178 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Camera Recorder Test</title>
+<title>Camera / PiP Test</title>
 <style>
 body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}
 main{max-width:900px;margin:auto;padding:16px}
-video{width:100%;background:#000;border-radius:10px;margin-top:10px}
-select,button{font-size:16px;padding:10px;margin:4px}
-.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-#status{white-space:pre-wrap;background:#222;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;max-height:300px;overflow:auto}
+video,canvas{width:100%;background:#000;border-radius:8px;margin-top:8px}
+canvas{display:none}
+select,input,button{font-size:16px;padding:10px;margin:4px}
 button:disabled{opacity:.4}
+.row{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+#status{background:#222;padding:10px;border-radius:8px;font:12px monospace;white-space:pre-wrap;max-height:350px;overflow:auto}
+.small{font-size:13px;color:#aaa}
 </style>
 </head>
 <body>
 <main>
-<h2>Camera Recorder Test</h2>
+
+<h2>Camera / PiP Test</h2>
 
 <div class="row">
 <select id="camera"></select>
 <button id="refresh">カメラ更新</button>
+<button id="startCamera">カメラ開始</button>
 </div>
 
 <div class="row">
-<button id="startCamera">カメラ開始</button>
 <button id="startRec" disabled>録画開始</button>
 <button id="stopRec" disabled>録画停止</button>
-<button id="pip" disabled>PiP</button>
 </div>
 
-<h3>Live</h3>
+<h3>PiPテスト</h3>
+
+<div class="row">
+<button id="pipCamera" disabled>A: Camera直接PiP</button>
+<button id="pipCanvas" disabled>B: Canvas経由PiP</button>
+<button id="pipDummy">C: 別動画PiP</button>
+<button id="exitPip">PiP終了</button>
+</div>
+
+<div class="small">
+A = getUserMediaの映像そのもの<br>
+B = カメラ → canvas → captureStream → PiP<br>
+C = カメラとは無関係な通常MP4をPiP
+</div>
+
+<h3>Live Camera</h3>
 <video id="live" autoplay muted playsinline></video>
+
+<canvas id="copyCanvas"></canvas>
+
+<video id="canvasVideo" autoplay muted playsinline style="display:none"></video>
+
+<video
+    id="dummyVideo"
+    playsinline
+    muted
+    loop
+    preload="auto"
+    style="display:none"
+    src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4">
+</video>
 
 <h3>Recorded</h3>
 <video id="playback" controls playsinline></video>
 
 <div class="row">
-<a id="download" hidden>
-<button>録画ファイル保存</button>
-</a>
+<a id="download" hidden><button>録画保存</button></a>
 </div>
 
 <h3>Status</h3>
 <div id="status"></div>
+
 </main>
 
 <script>
-const camera = document.querySelector('#camera');
-const live = document.querySelector('#live');
-const playback = document.querySelector('#playback');
-const statusBox = document.querySelector('#status');
-const startCameraBtn = document.querySelector('#startCamera');
-const startRecBtn = document.querySelector('#startRec');
-const stopRecBtn = document.querySelector('#stopRec');
-const pipBtn = document.querySelector('#pip');
-const refreshBtn = document.querySelector('#refresh');
-const download = document.querySelector('#download');
+const $=s=>document.querySelector(s);
 
-let stream = null;
-let recorder = null;
-let chunks = [];
-let recordedURL = null;
+const camera=$('#camera');
+const live=$('#live');
+const playback=$('#playback');
+const copyCanvas=$('#copyCanvas');
+const canvasVideo=$('#canvasVideo');
+const dummyVideo=$('#dummyVideo');
+const statusBox=$('#status');
+
+const startCameraBtn=$('#startCamera');
+const startRecBtn=$('#startRec');
+const stopRecBtn=$('#stopRec');
+const pipCameraBtn=$('#pipCamera');
+const pipCanvasBtn=$('#pipCanvas');
+
+let stream=null;
+let recorder=null;
+let chunks=[];
+let recordedURL=null;
+
+let canvasStream=null;
+let canvasRAF=null;
+
+let lastVideoTime=-1;
+let freezeCheckTimer=null;
 
 function log(msg){
-    const t = new Date().toLocaleTimeString();
-    statusBox.textContent += `[${t}] ${msg}\n`;
-    statusBox.scrollTop = statusBox.scrollHeight;
+    const t=new Date().toLocaleTimeString();
+    statusBox.textContent+=`[${t}] ${msg}\n`;
+    statusBox.scrollTop=statusBox.scrollHeight;
 }
 
 async function enumerateCameras(){
     try{
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const cams = devices.filter(d => d.kind === 'videoinput');
-        const current = camera.value;
-        camera.innerHTML = '';
+        const devices=await navigator.mediaDevices.enumerateDevices();
+        const cams=devices.filter(d=>d.kind==='videoinput');
+        const old=camera.value;
+
+        camera.innerHTML='';
 
         cams.forEach((d,i)=>{
-            const option = document.createElement('option');
-            option.value = d.deviceId;
-            option.textContent = d.label || `Camera ${i+1}`;
-            camera.appendChild(option);
+            const o=document.createElement('option');
+            o.value=d.deviceId;
+            o.textContent=d.label||`Camera ${i+1}`;
+            camera.appendChild(o);
         });
 
-        if([...camera.options].some(o => o.value === current)){
-            camera.value = current;
-        }
+        if([...camera.options].some(o=>o.value===old))
+            camera.value=old;
 
         log(`カメラ ${cams.length}台`);
     }catch(e){
-        log(`enumerateDevices error: ${e.name}: ${e.message}`);
+        log(`enumerateDevices: ${e.name}: ${e.message}`);
     }
 }
 
 async function startCamera(){
     try{
-        if(stream){
-            stream.getTracks().forEach(t => t.stop());
-        }
+        stopCanvasCopy();
 
-        const deviceId = camera.value;
+        if(stream)
+            stream.getTracks().forEach(t=>t.stop());
 
-        stream = await navigator.mediaDevices.getUserMedia({
-            video: deviceId
-                ? {deviceId:{exact:deviceId}}
+        stream=await navigator.mediaDevices.getUserMedia({
+            video:camera.value
+                ? {deviceId:{exact:camera.value}}
                 : {facingMode:{ideal:'environment'}},
             audio:true
         });
 
-        live.srcObject = stream;
+        live.srcObject=stream;
         await live.play();
 
-        for(const track of stream.getTracks()){
-            log(`${track.kind}: ${track.label}`);
-            track.addEventListener('mute',()=>{
-                log(`${track.kind} track muted`);
-            });
-            track.addEventListener('unmute',()=>{
-                log(`${track.kind} track unmuted`);
-            });
-            track.addEventListener('ended',()=>{
-                log(`${track.kind} track ended`);
-            });
+        for(const t of stream.getTracks()){
+            log(`${t.kind}: ${t.label}`);
+
+            t.onmute=()=>log(`${t.kind} TRACK MUTED`);
+            t.onunmute=()=>log(`${t.kind} TRACK UNMUTED`);
+            t.onended=()=>log(`${t.kind} TRACK ENDED`);
         }
 
-        startRecBtn.disabled = false;
-        pipBtn.disabled = false;
-
         await enumerateCameras();
+
+        startRecBtn.disabled=false;
+        pipCameraBtn.disabled=false;
+        pipCanvasBtn.disabled=false;
+
+        startFreezeMonitor();
+
         log('カメラ開始');
     }catch(e){
-        log(`getUserMedia error: ${e.name}: ${e.message}`);
+        log(`getUserMedia: ${e.name}: ${e.message}`);
     }
 }
 
 function getMime(){
-    const candidates = [
+    const types=[
         'video/mp4;codecs=h264,aac',
         'video/mp4;codecs=avc1,mp4a.40.2',
         'video/mp4',
@@ -144,141 +183,275 @@ function getMime(){
         'video/webm'
     ];
 
-    for(const type of candidates){
-        if(MediaRecorder.isTypeSupported(type)){
-            return type;
-        }
-    }
+    for(const t of types)
+        if(MediaRecorder.isTypeSupported(t))
+            return t;
 
     return '';
 }
 
 function startRecording(){
-    if(!stream) return;
+    if(!stream)return;
 
-    chunks = [];
+    chunks=[];
 
     try{
-        const mime = getMime();
+        const mime=getMime();
 
-        recorder = mime
+        recorder=mime
             ? new MediaRecorder(stream,{mimeType:mime})
             : new MediaRecorder(stream);
 
-        log(`Recorder MIME: ${recorder.mimeType || mime || 'default'}`);
+        log(`Recorder MIME=${recorder.mimeType||mime||'default'}`);
 
-        recorder.ondataavailable = e=>{
-            if(e.data && e.data.size > 0){
+        recorder.ondataavailable=e=>{
+            if(e.data?.size){
                 chunks.push(e.data);
                 log(`chunk ${e.data.size} bytes`);
             }
         };
 
-        recorder.onerror = e=>{
-            log(`Recorder error: ${e.error?.message || e}`);
+        recorder.onerror=e=>{
+            log(`Recorder ERROR ${e.error?.message||e}`);
         };
 
-        recorder.onstop = ()=>{
-            const type = recorder.mimeType || 'video/webm';
-            const blob = new Blob(chunks,{type});
+        recorder.onstop=()=>{
+            const type=recorder.mimeType||'video/webm';
+            const blob=new Blob(chunks,{type});
 
-            if(recordedURL){
+            if(recordedURL)
                 URL.revokeObjectURL(recordedURL);
-            }
 
-            recordedURL = URL.createObjectURL(blob);
+            recordedURL=URL.createObjectURL(blob);
 
-            playback.src = recordedURL;
+            playback.src=recordedURL;
             playback.load();
 
-            const ext = type.includes('mp4') ? 'mp4' : 'webm';
+            $('#download').href=recordedURL;
+            $('#download').download=
+                `pip_test_${Date.now()}.${type.includes('mp4')?'mp4':'webm'}`;
+            $('#download').hidden=false;
 
-            download.href = recordedURL;
-            download.download = `recording_${Date.now()}.${ext}`;
-            download.hidden = false;
-
-            log(`録画完了 ${(blob.size/1024/1024).toFixed(2)}MB`);
+            log(`録画完成 ${(blob.size/1024/1024).toFixed(2)} MB`);
         };
 
         recorder.start(1000);
 
-        startRecBtn.disabled = true;
-        stopRecBtn.disabled = false;
+        startRecBtn.disabled=true;
+        stopRecBtn.disabled=false;
 
-        log('録画開始');
+        log('========= 録画開始 =========');
     }catch(e){
-        log(`録画開始エラー: ${e.name}: ${e.message}`);
+        log(`Recorder start: ${e.name}: ${e.message}`);
     }
 }
 
 function stopRecording(){
-    if(recorder && recorder.state !== 'inactive'){
+    if(recorder&&recorder.state!=='inactive'){
         recorder.stop();
-        startRecBtn.disabled = false;
-        stopRecBtn.disabled = true;
-        log('録画停止');
+
+        startRecBtn.disabled=false;
+        stopRecBtn.disabled=true;
+
+        log('========= 録画停止 =========');
     }
 }
 
-async function startPiP(){
+async function leavePip(){
     try{
-        if(document.pictureInPictureElement){
+        if(document.pictureInPictureElement)
             await document.exitPictureInPicture();
-            log('PiP終了');
-            return;
-        }
-
-        if(!document.pictureInPictureEnabled){
-            log('Picture-in-Picture API非対応');
-            return;
-        }
-
-        await live.requestPictureInPicture();
-        log('PiP開始');
     }catch(e){
-        log(`PiP error: ${e.name}: ${e.message}`);
+        log(`PiP終了 error: ${e.message}`);
     }
 }
 
-function dumpState(){
+async function pipCamera(){
+    try{
+        await leavePip();
+
+        log('----- A: Camera直接PiP 開始 -----');
+
+        await live.play();
+        await live.requestPictureInPicture();
+
+        log('A: PiP成功');
+    }catch(e){
+        log(`A PiP ERROR: ${e.name}: ${e.message}`);
+    }
+}
+
+function startCanvasCopy(){
+    if(!stream)
+        throw new Error('camera not started');
+
+    stopCanvasCopy();
+
+    const settings=stream.getVideoTracks()[0].getSettings();
+
+    copyCanvas.width=settings.width||1280;
+    copyCanvas.height=settings.height||720;
+
+    const ctx=copyCanvas.getContext('2d');
+
+    function draw(){
+        try{
+            if(live.readyState>=2)
+                ctx.drawImage(
+                    live,
+                    0,0,
+                    copyCanvas.width,
+                    copyCanvas.height
+                );
+        }catch(e){}
+
+        canvasRAF=requestAnimationFrame(draw);
+    }
+
+    draw();
+
+    canvasStream=copyCanvas.captureStream(30);
+    canvasVideo.srcObject=canvasStream;
+
+    return canvasVideo.play();
+}
+
+function stopCanvasCopy(){
+    if(canvasRAF){
+        cancelAnimationFrame(canvasRAF);
+        canvasRAF=null;
+    }
+
+    if(canvasStream){
+        canvasStream.getTracks().forEach(t=>t.stop());
+        canvasStream=null;
+    }
+
+    canvasVideo.srcObject=null;
+}
+
+async function pipCanvas(){
+    try{
+        await leavePip();
+
+        log('----- B: Canvas経由PiP 開始 -----');
+
+        await startCanvasCopy();
+        await canvasVideo.requestPictureInPicture();
+
+        log('B: PiP成功');
+    }catch(e){
+        log(`B PiP ERROR: ${e.name}: ${e.message}`);
+    }
+}
+
+async function pipDummy(){
+    try{
+        await leavePip();
+
+        log('----- C: 別動画PiP 開始 -----');
+
+        dummyVideo.currentTime=0;
+        await dummyVideo.play();
+        await dummyVideo.requestPictureInPicture();
+
+        log('C: PiP成功');
+    }catch(e){
+        log(`C PiP ERROR: ${e.name}: ${e.message}`);
+    }
+}
+
+function dumpState(reason){
+    log(`--- STATE: ${reason} ---`);
     log(`visibility=${document.visibilityState}`);
     log(`focus=${document.hasFocus()}`);
 
     if(stream){
         for(const t of stream.getTracks()){
             log(
-                `${t.kind}: readyState=${t.readyState}, enabled=${t.enabled}, muted=${t.muted}`
+                `${t.kind}: readyState=${t.readyState}`+
+                ` enabled=${t.enabled}`+
+                ` muted=${t.muted}`
             );
         }
     }
 
-    if(recorder){
+    if(recorder)
         log(`MediaRecorder=${recorder.state}`);
-    }
+
+    log(`live currentTime=${live.currentTime.toFixed(2)}`);
 }
 
-document.addEventListener('visibilitychange', dumpState);
-window.addEventListener('focus',()=>log('window focus'));
-window.addEventListener('blur',()=>log('window blur'));
+function startFreezeMonitor(){
+    clearInterval(freezeCheckTimer);
 
-live.addEventListener('enterpictureinpicture',()=>{
-    log('enterpictureinpicture');
+    lastVideoTime=live.currentTime;
+
+    freezeCheckTimer=setInterval(()=>{
+        if(!stream)return;
+
+        const t=live.currentTime;
+
+        if(
+            recorder?.state==='recording' &&
+            document.visibilityState==='visible' &&
+            Math.abs(t-lastVideoTime)<0.01
+        ){
+            log(`WARNING: live video time停止 (${t.toFixed(2)})`);
+        }
+
+        lastVideoTime=t;
+    },3000);
+}
+
+document.addEventListener('visibilitychange',()=>{
+    dumpState(`visibilitychange → ${document.visibilityState}`);
 });
 
-live.addEventListener('leavepictureinpicture',()=>{
-    log('leavepictureinpicture');
+window.addEventListener('focus',()=>{
+    log('WINDOW FOCUS');
+    dumpState('focus');
 });
 
-refreshBtn.onclick = enumerateCameras;
-startCameraBtn.onclick = startCamera;
-startRecBtn.onclick = startRecording;
-stopRecBtn.onclick = stopRecording;
-pipBtn.onclick = startPiP;
+window.addEventListener('blur',()=>{
+    log('WINDOW BLUR');
+    dumpState('blur');
+});
 
-camera.addEventListener('change',async()=>{
-    if(stream){
-        await startCamera();
-    }
+for(const [name,v] of [
+    ['Camera',live],
+    ['Canvas',canvasVideo],
+    ['Dummy',dummyVideo]
+]){
+    v.addEventListener('enterpictureinpicture',()=>{
+        log(`${name}: ENTER PiP`);
+        dumpState(`${name} enter PiP`);
+    });
+
+    v.addEventListener('leavepictureinpicture',()=>{
+        log(`${name}: LEAVE PiP`);
+        dumpState(`${name} leave PiP`);
+    });
+
+    v.addEventListener('playing',()=>log(`${name}: playing`));
+    v.addEventListener('pause',()=>log(`${name}: pause`));
+    v.addEventListener('waiting',()=>log(`${name}: waiting`));
+    v.addEventListener('stalled',()=>log(`${name}: stalled`));
+}
+
+$('#refresh').onclick=enumerateCameras;
+startCameraBtn.onclick=startCamera;
+startRecBtn.onclick=startRecording;
+stopRecBtn.onclick=stopRecording;
+
+$('#pipCamera').onclick=pipCamera;
+$('#pipCanvas').onclick=pipCanvas;
+$('#pipDummy').onclick=pipDummy;
+$('#exitPip').onclick=leavePip;
+
+camera.addEventListener('change',()=>{
+    if(stream)
+        startCamera();
 });
 
 (async()=>{
@@ -287,18 +460,18 @@ camera.addEventListener('change',async()=>{
     log(navigator.userAgent);
 
     try{
-        const temp = await navigator.mediaDevices.getUserMedia({
+        const tmp=await navigator.mediaDevices.getUserMedia({
             video:true,
             audio:true
         });
 
-        temp.getTracks().forEach(t=>t.stop());
+        tmp.getTracks().forEach(t=>t.stop());
 
         await enumerateCameras();
 
-        log('初期権限取得OK');
+        log('初期カメラ権限 OK');
     }catch(e){
-        log(`初期権限取得: ${e.name}: ${e.message}`);
+        log(`初期権限: ${e.name}: ${e.message}`);
     }
 })();
 </script>
